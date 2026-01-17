@@ -1,0 +1,262 @@
+# ============================================================
+# ResNet18 (ImageNet 预训练) + K 折交叉验证 + 概率集成
+# 适配情绪标签：
+# 0: Angry, 1: Fear, 2: Happy, 3: Sad, 4: Surprise, 5: Neutral
+# 目录结构：
+#   data_root/train/Angry/*.jpg
+#   data_root/train/Fear/*.jpg
+#   ...
+#   data_root/test/*.jpg
+# ============================================================
+
+import os
+import glob
+import random
+import numpy as np
+import pandas as pd
+
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, models
+
+from sklearn.model_selection import StratifiedKFold
+
+# ------------------ 配置区（根据需要改） ------------------
+CONFIG = {
+    "data_root": "/kaggle/input/mltask3/fer_data/fer_data",  # ⚠️ 如果路径不同改这里
+
+    "n_folds": 5,                # 调试可以先改成 3
+    "batch_size": 128,
+    "num_epochs": 15,            # 调试先 8~10，稳定后再加
+    "lr": 3e-4,
+    "num_workers": 2,
+    "seed": 42,
+
+    "use_class_weights": True,
+    "early_stopping_patience": 4,
+
+    "strip_test_ext": False,     # 如果比赛要求 ID 不带 .jpg，就改 True
+}
+# ------------------------------------------------------
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(CONFIG["seed"])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+
+# ============================================================
+# 1. 加载训练集所有图片路径 & 标签
+# ============================================================
+DATA_ROOT = CONFIG["data_root"]
+TRAIN_DIR = os.path.join(DATA_ROOT, "train")
+TEST_DIR = os.path.join(DATA_ROOT, "test")
+
+print("TRAIN_DIR:", TRAIN_DIR)
+print("TEST_DIR :", TEST_DIR)
+print("Train classes (folders):", os.listdir(TRAIN_DIR))
+
+# 文件夹名 -> 标签 id（按题目要求）
+kaggle_label_map = {
+    "Angry": 0,
+    "Fear": 1,
+    "Happy": 2,
+    "Sad": 3,
+    "Surprise": 4,
+    "Neutral": 5,
+}
+class_names = sorted(kaggle_label_map.keys())
+print("Class names (sorted):", class_names)
+
+image_paths = []
+labels = []
+
+exts = ("*.jpg", "*.jpeg", "*.png")
+
+for class_name in class_names:
+    class_dir = os.path.join(TRAIN_DIR, class_name)
+    files = []
+    for ext in exts:
+        files.extend(glob.glob(os.path.join(class_dir, ext)))
+    files = sorted(files)
+    print(f"{class_name}: {len(files)} images")
+    image_paths.extend(files)
+    labels.extend([kaggle_label_map[class_name]] * len(files))
+
+image_paths = np.array(image_paths)
+labels = np.array(labels)
+num_classes = len(kaggle_label_map)
+
+print("Total train images:", len(image_paths))
+
+
+# ============================================================
+# 2. 类别权重（处理类别不均衡）
+# ============================================================
+if CONFIG["use_class_weights"]:
+    label_counts = np.bincount(labels, minlength=num_classes)
+    print("Label counts:", label_counts)
+    inv_freq = 1.0 / label_counts
+    class_weights = inv_freq / inv_freq.mean()
+    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    print("Class weights:", class_weights)
+else:
+    class_weights = None
+
+
+# ============================================================
+# 3. Dataset & Transform（ResNet18 / ImageNet 标准预处理）
+# ============================================================
+# 标准 ImageNet 归一化
+imagenet_mean = [0.485, 0.456, 0.406]
+imagenet_std  = [0.229, 0.224, 0.225]
+
+train_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=3),        # 48x48 灰度 -> 3 通道
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.25, contrast=0.25),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+])
+
+val_test_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
+])
+
+
+class FERDataset(Dataset):
+    def __init__(self, paths, labels, transform):
+        self.paths = list(paths)
+        self.labels = list(labels)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        img = Image.open(path).convert("L")   # 原图灰度
+        if self.transform is not None:
+            img = self.transform(img)
+        label = self.labels[idx]
+        return img, label
+
+
+class TestDataset(Dataset):
+    def __init__(self, img_dir, transform=None):
+        paths = []
+        for ext in exts:
+            paths.extend(glob.glob(os.path.join(img_dir, ext)))
+        self.paths = sorted(paths)
+        self.ids = [os.path.basename(p) for p in self.paths]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        img = Image.open(path).convert("L")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, self.ids[idx]
+
+
+test_dataset = TestDataset(TEST_DIR, transform=val_test_transform)
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=256,
+    shuffle=False,
+    num_workers=CONFIG["num_workers"],
+    pin_memory=True,
+)
+print("Num test images:", len(test_dataset))
+
+
+# ============================================================
+# 4. 定义 ResNet18 模型（加载 ImageNet 预训练权重）
+# ============================================================
+def create_model(num_classes: int):
+    # 兼容 torch / torchvision 旧新两种写法
+    try:
+        from torchvision.models import resnet18, ResNet18_Weights
+        backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    except Exception:
+        backbone = models.resnet18(pretrained=True)
+
+    in_features = backbone.fc.in_features
+    backbone.fc = nn.Linear(in_features, num_classes)
+    return backbone
+
+
+def get_criterion():
+    try:
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=0.05,   # 有标签噪声时更稳一点
+        )
+    except TypeError:
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+        )
+    return criterion
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * images.size(0)
+        _, preds = torch.max(outputs, 1)
+        correct += (preds == targets).sum().item()
+        total += targets.size(0)
+
+    return running_loss / total, correct / total
+
+
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+
